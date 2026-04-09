@@ -13,6 +13,16 @@ import skip.ui.__
 // https://firebase.google.com/docs/reference/swift/firebaseauth/api/reference/Classes/Auth
 // https://firebase.google.com/docs/reference/android/com/google/firebase/auth/FirebaseAuth
 
+/// Shared first-factor email/password sign-in outcome.
+///
+/// On Android, callers outside transpiled `SKIP` code should prefer `signInResult(withEmail:password:)`
+/// for MFA-aware flows because the underlying Kotlin exception type is not preserved once it crosses back
+/// into native Swift.
+public enum EmailSignInResult {
+    case signedIn(AuthDataResult)
+    case secondFactorRequired(MultiFactorResolver)
+}
+
 public final class Auth {
     public let platformValue: com.google.firebase.auth.FirebaseAuth
 
@@ -42,6 +52,23 @@ public final class Auth {
     public func signIn(withEmail email: String, password: String) async throws -> AuthDataResult {
         let result = platformValue.signInWithEmailAndPassword(email, password).await()
         return AuthDataResult(result)
+    }
+
+    /// Shared async sign-in API for MFA-aware email/password sign-in.
+    ///
+    /// Use this on Android when the caller is native Swift code rather than transpiled `SKIP` code.
+    /// In that case, Firebase's `FirebaseAuthMultiFactorException` cannot be recovered reliably at the
+    /// call site, so this API normalizes the flow to either a signed-in result or a resolver.
+    public func signInResult(withEmail email: String, password: String) async throws -> EmailSignInResult {
+        do {
+            let result = try await signIn(withEmail: email, password: password)
+            return .signedIn(result)
+        } catch {
+            if let resolver = multiFactorResolver(for: error) {
+                return .secondFactorRequired(resolver)
+            }
+            throw error
+        }
     }
 
     /// Throws `FirebaseAuthWeakPasswordException`/`FirebaseAuthInvalidCredentialsException`/`FirebaseAuthUserCollisionException`
@@ -328,6 +355,136 @@ public class User: Equatable, KotlinConverting<com.google.firebase.auth.Firebase
     }
 }
 
+public let PhoneMultiFactorID = "phone"
+public let TotpMultiFactorID = "totp"
+
+public class MultiFactorSession {
+    fileprivate let platformValue: com.google.firebase.auth.MultiFactorSession
+
+    fileprivate init(_ platformValue: com.google.firebase.auth.MultiFactorSession) {
+        self.platformValue = platformValue
+    }
+}
+
+open class MultiFactorInfo {
+    fileprivate let platformValue: com.google.firebase.auth.MultiFactorInfo
+
+    fileprivate init(_ platformValue: com.google.firebase.auth.MultiFactorInfo) {
+        self.platformValue = platformValue
+    }
+
+    public var uid: String {
+        platformValue.getUid()
+    }
+
+    public var displayName: String? {
+        platformValue.getDisplayName()
+    }
+
+    public var enrollmentDate: Date {
+        Date(timeIntervalSince1970: Double(platformValue.getEnrollmentTimestamp()))
+    }
+
+    public var factorID: String {
+        platformValue.getFactorId()
+    }
+}
+
+public final class PhoneMultiFactorInfo : MultiFactorInfo {
+    public static let PhoneMultiFactorID = "phone"
+    public static let TOTPMultiFactorID = "totp"
+
+    fileprivate var phonePlatformValue: com.google.firebase.auth.PhoneMultiFactorInfo {
+        platformValue as! com.google.firebase.auth.PhoneMultiFactorInfo
+    }
+
+    fileprivate init(_ platformValue: com.google.firebase.auth.PhoneMultiFactorInfo) {
+        super.init(platformValue)
+    }
+
+    public var phoneNumber: String {
+        phonePlatformValue.getPhoneNumber()
+    }
+}
+
+open class MultiFactorAssertion {
+    fileprivate let platformValue: com.google.firebase.auth.MultiFactorAssertion
+
+    fileprivate init(_ platformValue: com.google.firebase.auth.MultiFactorAssertion) {
+        self.platformValue = platformValue
+    }
+
+    public var factorID: String {
+        platformValue.getFactorId()
+    }
+}
+
+public final class PhoneMultiFactorAssertion : MultiFactorAssertion {
+    fileprivate init(_ platformValue: com.google.firebase.auth.PhoneMultiFactorAssertion) {
+        super.init(platformValue)
+    }
+}
+
+public final class PhoneMultiFactorGenerator {
+    public static let factorID: String = com.google.firebase.auth.PhoneMultiFactorGenerator.FACTOR_ID
+
+    public static func assertion(with credential: AuthCredential) -> PhoneMultiFactorAssertion {
+        let phoneCredential = credential.platformValue as! com.google.firebase.auth.PhoneAuthCredential
+        return PhoneMultiFactorAssertion(com.google.firebase.auth.PhoneMultiFactorGenerator.getAssertion(phoneCredential))
+    }
+}
+
+public final class MultiFactorResolver {
+    fileprivate let platformValue: com.google.firebase.auth.MultiFactorResolver
+
+    fileprivate init(_ platformValue: com.google.firebase.auth.MultiFactorResolver) {
+        self.platformValue = platformValue
+    }
+
+    public var session: MultiFactorSession {
+        MultiFactorSession(platformValue.getSession())
+    }
+
+    public var hints: [MultiFactorInfo] {
+        var swift: [MultiFactorInfo] = []
+        let iterator = platformValue.getHints().iterator()
+        while iterator.hasNext() {
+            if let hint = iterator.next() {
+                swift.append(wrapMultiFactorInfo(hint))
+            }
+        }
+        return swift
+    }
+
+    public var auth: Auth {
+        Auth(platformValue: platformValue.getFirebaseAuth())
+    }
+
+    public func resolveSignIn(with assertion: MultiFactorAssertion) async throws -> AuthDataResult {
+		let result = try await platformValue.resolveSignIn(assertion.platformValue).await()
+        return AuthDataResult(result)
+    }
+
+    public func resolveSignIn(with assertion: MultiFactorAssertion, completion: @escaping (AuthDataResult?, Error?) -> Void) {
+        platformValue
+            .resolveSignIn(assertion.platformValue)
+            .addOnSuccessListener { result in
+                completion(AuthDataResult(result), nil)
+            }
+            .addOnFailureListener { exception in
+                completion(nil, mapAuthNSError(exception))
+            }
+    }
+}
+
+fileprivate func wrapMultiFactorInfo(_ platformValue: com.google.firebase.auth.MultiFactorInfo) -> MultiFactorInfo {
+    if let phoneInfo = platformValue as? com.google.firebase.auth.PhoneMultiFactorInfo {
+        return PhoneMultiFactorInfo(phoneInfo)
+    } else {
+        return MultiFactorInfo(platformValue)
+    }
+}
+
 /// Additional user information associated with an auth result
 public final class AdditionalUserInfo: KotlinConverting<com.google.firebase.auth.AdditionalUserInfo> {
     public let platformValue: com.google.firebase.auth.AdditionalUserInfo
@@ -353,13 +510,147 @@ public final class AdditionalUserInfo: KotlinConverting<com.google.firebase.auth
 
 public let AuthErrorDomain = "FIRAuthErrorDomain"
 public let AuthErrorUserInfoEmailKey = "FIRAuthErrorUserInfoEmailKey"
+public let AuthErrorUserInfoMultiFactorResolverKey = "FIRAuthErrorUserInfoMultiFactorResolverKey"
 
 public enum AuthErrorCode: Int {
     case accountExistsWithDifferentCredential = 17012
+    case secondFactorRequired = 17078
+    case missingMultiFactorSession = 17081
+    case missingMultiFactorInfo = 17082
+    case invalidMultiFactorSession = 17083
+    case multiFactorInfoNotFound = 17084
+    case secondFactorAlreadyEnrolled = 17087
+    case maximumSecondFactorCountExceeded = 17088
+    case unsupportedFirstFactor = 17089
+}
+
+fileprivate final class AuthNSError : NSError {
+    private var additionalUserInfo: [String: Any] = [:]
+    private var multiFactorResolverValue: MultiFactorResolver?
+
+    init(
+        code: Int,
+        userInfo: [String: Any] = [:],
+        multiFactorResolver: MultiFactorResolver? = nil
+    ) {
+        super.init(domain: "FIRAuthErrorDomain", code: code, userInfo: userInfo)
+        self.additionalUserInfo = userInfo
+        self.multiFactorResolverValue = multiFactorResolver
+    }
+
+    override var userInfo: [String : Any] {
+        var info = additionalUserInfo
+        if let multiFactorResolverValue {
+            info[AuthErrorUserInfoMultiFactorResolverKey] = multiFactorResolverValue
+        }
+        return info
+    }
+}
+
+fileprivate func firebaseAuthException(for error: Error) -> com.google.firebase.auth.FirebaseAuthException? {
+    if let authException = error as? com.google.firebase.auth.FirebaseAuthException {
+        return authException
+    }
+
+    var throwable: Throwable?
+    if let exception = error as? Exception {
+        throwable = exception
+    } else if let nsError = error as? NSError, let exception = nsError as? Exception {
+        throwable = exception
+    }
+
+    while let currentThrowable = throwable {
+        if let authException = currentThrowable as? com.google.firebase.auth.FirebaseAuthException {
+            return authException
+        }
+        throwable = currentThrowable.cause
+    }
+
+    return nil
+}
+
+fileprivate func firebaseAuthMultiFactorException(for error: Error) -> com.google.firebase.auth.FirebaseAuthMultiFactorException? {
+    firebaseAuthException(for: error) as? com.google.firebase.auth.FirebaseAuthMultiFactorException
+}
+
+fileprivate func mappedAuthErrorCode(for exception: com.google.firebase.auth.FirebaseAuthException) -> AuthErrorCode? {
+    if exception is com.google.firebase.auth.FirebaseAuthMultiFactorException {
+        return .secondFactorRequired
+    }
+    if exception is com.google.firebase.auth.FirebaseAuthUserCollisionException {
+        return .accountExistsWithDifferentCredential
+    }
+
+    switch exception.getErrorCode() {
+    case "ERROR_MISSING_MULTI_FACTOR_SESSION":
+        return .missingMultiFactorSession
+    case "ERROR_MISSING_MULTI_FACTOR_INFO":
+        return .missingMultiFactorInfo
+    case "ERROR_INVALID_MULTI_FACTOR_SESSION":
+        return .invalidMultiFactorSession
+    case "ERROR_MULTI_FACTOR_INFO_NOT_FOUND":
+        return .multiFactorInfoNotFound
+    case "ERROR_SECOND_FACTOR_ALREADY_ENROLLED":
+        return .secondFactorAlreadyEnrolled
+    case "ERROR_MAXIMUM_SECOND_FACTOR_COUNT_EXCEEDED":
+        return .maximumSecondFactorCountExceeded
+    case "ERROR_UNSUPPORTED_FIRST_FACTOR":
+        return .unsupportedFirstFactor
+    default:
+        return nil
+    }
+}
+
+/// Best-effort extraction of a Firebase auth error code from a platform error.
+///
+/// On Android, this first inspects the underlying `FirebaseAuthException` chain before attempting
+/// any `NSError` compatibility mapping.
+public func authErrorCode(for error: Error) -> AuthErrorCode? {
+    // On Android, Firebase exposes MFA through FirebaseAuthMultiFactorException.
+    // Prefer the underlying exception chain over NSError projection.
+    if let authException = firebaseAuthException(for: error) {
+        return mappedAuthErrorCode(for: authException)
+    }
+    if let authError = error as? AuthNSError, let code = AuthErrorCode(rawValue: authError.code) {
+        return code
+    }
+    if let nsError = error as? NSError,
+       nsError.domain == AuthErrorDomain,
+       let code = AuthErrorCode(rawValue: nsError.code) {
+        return code
+    }
+    return nil
+}
+
+/// Best-effort extraction of a `MultiFactorResolver` from a platform error.
+///
+/// On Android, this follows Firebase's native contract and prefers
+/// `FirebaseAuthMultiFactorException.getResolver()`.
+public func multiFactorResolver(for error: Error) -> MultiFactorResolver? {
+    // On Android, this is the canonical MFA path:
+    // (task.exception as FirebaseAuthMultiFactorException).resolver
+    if let multiFactorException = firebaseAuthMultiFactorException(for: error) {
+        return MultiFactorResolver(multiFactorException.getResolver())
+    }
+    if let authError = error as? AuthNSError, let resolver = authError.userInfo[AuthErrorUserInfoMultiFactorResolverKey] as? MultiFactorResolver {
+        return resolver
+    }
+    if let nsError = error as? NSError {
+        if let resolver = nsError.userInfo[AuthErrorUserInfoMultiFactorResolverKey] as? MultiFactorResolver {
+            return resolver
+        }
+    }
+    return nil
 }
 
 /// Map Android auth exceptions to iOS-style NSError when feasible
 fileprivate func mapAuthNSError(_ exception: Exception) -> Error {
+    if let multiFactor = exception as? com.google.firebase.auth.FirebaseAuthMultiFactorException {
+        return AuthNSError(
+            code: AuthErrorCode.secondFactorRequired.rawValue,
+            multiFactorResolver: MultiFactorResolver(multiFactor.getResolver())
+        )
+    }
     if let collision = exception as? com.google.firebase.auth.FirebaseAuthUserCollisionException {
         var userInfo: [String: Any] = [:]
         // Try to extract email if available
@@ -370,7 +661,11 @@ fileprivate func mapAuthNSError(_ exception: Exception) -> Error {
                 userInfo[AuthErrorUserInfoEmailKey] = message
             }
         }
-        return NSError(domain: AuthErrorDomain, code: AuthErrorCode.accountExistsWithDifferentCredential.rawValue, userInfo: userInfo)
+        return AuthNSError(code: AuthErrorCode.accountExistsWithDifferentCredential.rawValue, userInfo: userInfo)
+    }
+    if let authException = exception as? com.google.firebase.auth.FirebaseAuthException,
+       let mappedCode = mappedAuthErrorCode(for: authException) {
+        return AuthNSError(code: mappedCode.rawValue)
     }
     return ErrorException(exception)
 }
@@ -568,15 +863,10 @@ public final class PhoneAuthProvider {
     }
 
     @MainActor
-    private func startVerification(
-        _ phoneNumber: String,
-        uiDelegate: Any? = nil,
-        timeout: TimeInterval = 60.0,
-        forceResendingToken: PhoneAuthResendingToken? = nil,
+    private func makeVerificationCallbacks(
         onResult: @escaping (PhoneAuthVerificationResult) -> Void,
         onFailure: @escaping (Error) -> Void
-    ) {
-        _ = uiDelegate
+    ) -> PhoneAuthStateDidChangeCallbacks {
         let callbackID = UUID().uuidString
 
         let state = PhoneAuthVerificationState(
@@ -588,9 +878,16 @@ public final class PhoneAuthProvider {
         )
         let callbacks = PhoneAuthStateDidChangeCallbacks(state: state)
         PhoneAuthProvider.registerVerificationCallbacks(callbacks, callbackID: callbackID)
+        return callbacks
+    }
 
+    @MainActor
+    private func makeVerificationBuilder(
+        timeout: TimeInterval = 60.0,
+        forceResendingToken: PhoneAuthResendingToken? = nil,
+        callbacks: PhoneAuthStateDidChangeCallbacks
+    ) -> com.google.firebase.auth.PhoneAuthOptions.Builder {
         let builder = com.google.firebase.auth.PhoneAuthOptions.newBuilder(auth)
-            .setPhoneNumber(phoneNumber)
             .setTimeout(Int64(max(timeout, 0.0).rounded()), TimeUnit.SECONDS)
             .setCallbacks(callbacks)
 
@@ -600,6 +897,41 @@ public final class PhoneAuthProvider {
         if let forceResendingToken {
             builder.setForceResendingToken(forceResendingToken.platformValue)
         }
+        return builder
+    }
+
+    @MainActor
+    private func startVerification(
+        _ phoneNumber: String,
+        uiDelegate: Any? = nil,
+        timeout: TimeInterval = 60.0,
+        forceResendingToken: PhoneAuthResendingToken? = nil,
+        onResult: @escaping (PhoneAuthVerificationResult) -> Void,
+        onFailure: @escaping (Error) -> Void
+    ) {
+        _ = uiDelegate
+        let callbacks = makeVerificationCallbacks(onResult: onResult, onFailure: onFailure)
+        let builder = makeVerificationBuilder(timeout: timeout, forceResendingToken: forceResendingToken, callbacks: callbacks)
+            .setPhoneNumber(phoneNumber)
+
+        com.google.firebase.auth.PhoneAuthProvider.verifyPhoneNumber(builder.build())
+    }
+
+    @MainActor
+    private func startVerification(
+        with multiFactorInfo: PhoneMultiFactorInfo,
+        uiDelegate: Any? = nil,
+        multiFactorSession: MultiFactorSession,
+        timeout: TimeInterval = 60.0,
+        forceResendingToken: PhoneAuthResendingToken? = nil,
+        onResult: @escaping (PhoneAuthVerificationResult) -> Void,
+        onFailure: @escaping (Error) -> Void
+    ) {
+        _ = uiDelegate
+        let callbacks = makeVerificationCallbacks(onResult: onResult, onFailure: onFailure)
+        let builder = makeVerificationBuilder(timeout: timeout, forceResendingToken: forceResendingToken, callbacks: callbacks)
+            .setMultiFactorSession(multiFactorSession.platformValue)
+            .setMultiFactorHint(multiFactorInfo.phonePlatformValue)
 
         com.google.firebase.auth.PhoneAuthProvider.verifyPhoneNumber(builder.build())
     }
@@ -615,6 +947,34 @@ public final class PhoneAuthProvider {
         startVerification(
             phoneNumber,
             uiDelegate: uiDelegate,
+            onResult: { result in
+                switch result {
+                case .codeSent(let verificationID, _):
+                    completion(verificationID, nil)
+                case .verificationCompleted:
+                    completion(nil, unsupportedPhoneAuthCompletionError())
+                }
+            },
+            onFailure: { error in
+                completion(nil, error)
+            }
+        )
+    }
+
+    /// iOS-compatible completion API for second-factor sign-in. If Android completes verification
+    /// without issuing a verification ID, the completion receives an error and callers should switch
+    /// to `verifyPhoneNumberResult(with:uiDelegate:multiFactorSession:timeout:forceResendingToken:)`.
+    @MainActor
+    public func verifyPhoneNumber(
+        with multiFactorInfo: PhoneMultiFactorInfo,
+        uiDelegate: Any? = nil,
+        multiFactorSession: MultiFactorSession,
+        completion: @escaping (String?, Error?) -> Void
+    ) {
+        startVerification(
+            with: multiFactorInfo,
+            uiDelegate: uiDelegate,
+            multiFactorSession: multiFactorSession,
             onResult: { result in
                 switch result {
                 case .codeSent(let verificationID, _):
@@ -656,6 +1016,39 @@ public final class PhoneAuthProvider {
         return verificationID
     }
 
+    /// iOS-compatible async API for second-factor sign-in. If Android completes verification without
+    /// issuing a verification ID, this throws and callers should switch to
+    /// `verifyPhoneNumberResult(with:uiDelegate:multiFactorSession:timeout:forceResendingToken:)`.
+    @MainActor
+    public func verifyPhoneNumber(
+        with multiFactorInfo: PhoneMultiFactorInfo,
+        uiDelegate: Any? = nil,
+        multiFactorSession: MultiFactorSession
+    ) async throws -> String {
+        let verificationID = try await withCheckedThrowingContinuation { continuation in
+            startVerification(
+                with: multiFactorInfo,
+                uiDelegate: uiDelegate,
+                multiFactorSession: multiFactorSession,
+                onResult: { result in
+                    android.util.Log.d("SkipFirebaseAuth", "Phone MFA string continuation resume(returning/throwing:)")
+                    switch result {
+                    case .codeSent(let verificationID, _):
+                        continuation.resume(returning: verificationID)
+                    case .verificationCompleted:
+                        continuation.resume(throwing: unsupportedPhoneAuthCompletionError())
+                    }
+                },
+                onFailure: { error in
+                    android.util.Log.d("SkipFirebaseAuth", "Phone MFA string continuation resume(throwing:)")
+                    continuation.resume(throwing: error)
+                }
+            )
+        }
+        android.util.Log.d("SkipFirebaseAuth", "Phone MFA async string returned to caller")
+        return verificationID
+    }
+
     /// Async phone verification API that returns the first actionable Firebase result:
     /// either a verification ID was sent or Android completed instant verification with a credential.
     /// The `uiDelegate` parameter is ignored on Android and exists for source compatibility with Apple platforms.
@@ -683,6 +1076,38 @@ public final class PhoneAuthProvider {
             )
         }
         android.util.Log.d("SkipFirebaseAuth", "Phone auth async result returned to caller")
+        return result
+    }
+
+    /// Async second-factor phone verification API that returns the first actionable Firebase result:
+    /// either a verification ID was sent or Android completed instant verification with a credential.
+    /// The `uiDelegate` parameter is ignored on Android and exists for source compatibility with Apple platforms.
+    @MainActor
+    public func verifyPhoneNumberResult(
+        with multiFactorInfo: PhoneMultiFactorInfo,
+        uiDelegate: Any? = nil,
+        multiFactorSession: MultiFactorSession,
+        timeout: TimeInterval = 60.0,
+        forceResendingToken: PhoneAuthResendingToken? = nil
+    ) async throws -> PhoneAuthVerificationResult {
+        let result = try await withCheckedThrowingContinuation { continuation in
+            startVerification(
+                with: multiFactorInfo,
+                uiDelegate: uiDelegate,
+                multiFactorSession: multiFactorSession,
+                timeout: timeout,
+                forceResendingToken: forceResendingToken,
+                onResult: { result in
+                    android.util.Log.d("SkipFirebaseAuth", "Phone MFA result continuation resume(returning:)")
+                    continuation.resume(returning: result)
+                },
+                onFailure: { error in
+                    android.util.Log.d("SkipFirebaseAuth", "Phone MFA result continuation resume(throwing:)")
+                    continuation.resume(throwing: error)
+                }
+            )
+        }
+        android.util.Log.d("SkipFirebaseAuth", "Phone MFA async result returned to caller")
         return result
     }
 
@@ -766,6 +1191,15 @@ public final class OAuthProvider {
 import Foundation
 import FirebaseAuth
 
+/// Shared first-factor email/password sign-in outcome.
+///
+/// This mirrors the Android helper API so shared app code can opt into a typed MFA-aware sign-in
+/// path on both platforms.
+public enum EmailSignInResult {
+    case signedIn(AuthDataResult)
+    case secondFactorRequired(MultiFactorResolver)
+}
+
 public final class PhoneAuthResendingToken {
     fileprivate init() {
     }
@@ -774,6 +1208,41 @@ public final class PhoneAuthResendingToken {
 public enum PhoneAuthVerificationResult {
     case codeSent(verificationID: String, resendingToken: PhoneAuthResendingToken?)
     case verificationCompleted(AuthCredential)
+}
+
+/// Best-effort extraction of a Firebase auth error code from a platform error.
+public func authErrorCode(for error: Error) -> AuthErrorCode? {
+    let nsError = error as NSError
+    guard nsError.domain == AuthErrorDomain else {
+        return nil
+    }
+    return AuthErrorCode(rawValue: nsError.code)
+}
+
+/// Best-effort extraction of a `MultiFactorResolver` from a platform error.
+public func multiFactorResolver(for error: Error) -> MultiFactorResolver? {
+    let nsError = error as NSError
+    return nsError.userInfo[AuthErrorUserInfoMultiFactorResolverKey] as? MultiFactorResolver
+}
+
+@available(iOS 13, tvOS 13, macCatalyst 13, *)
+public extension Auth {
+    /// Shared async sign-in API for MFA-aware email/password sign-in.
+    ///
+    /// This mirrors the Android helper API. Native iOS callers may still use FirebaseAuth's
+    /// `signIn(withEmail:password:)` directly and inspect the thrown `NSError`, but this method
+    /// provides the same typed result shape as Android for shared code that imports `SkipFirebaseAuth`.
+    func signInResult(withEmail email: String, password: String) async throws -> EmailSignInResult {
+        do {
+            let result = try await signIn(withEmail: email, password: password)
+            return .signedIn(result)
+        } catch {
+            if let resolver = multiFactorResolver(for: error) {
+                return .secondFactorRequired(resolver)
+            }
+            throw error
+        }
+    }
 }
 
 #if os(iOS)
@@ -794,6 +1263,39 @@ public extension PhoneAuthProvider {
 
         let verificationID = try await verifyPhoneNumber(phoneNumber, uiDelegate: uiDelegate as? FirebaseAuth.AuthUIDelegate)
         return .codeSent(verificationID: verificationID, resendingToken: nil)
+    }
+
+    /// Async second-factor phone verification API that mirrors the Android wrapper.
+    /// On Apple platforms, `timeout` and `forceResendingToken` are ignored because the native API
+    /// only yields a verification ID or an error.
+    @MainActor
+    func verifyPhoneNumberResult(
+        with multiFactorInfo: PhoneMultiFactorInfo,
+        uiDelegate: Any? = nil,
+        multiFactorSession: MultiFactorSession,
+        timeout: TimeInterval = 60.0,
+        forceResendingToken: PhoneAuthResendingToken? = nil
+    ) async throws -> PhoneAuthVerificationResult {
+        _ = timeout
+        _ = forceResendingToken
+
+        let verificationID = try await verifyPhoneNumber(
+            with: multiFactorInfo,
+            uiDelegate: uiDelegate as? FirebaseAuth.AuthUIDelegate,
+            multiFactorSession: multiFactorSession
+        )
+        return .codeSent(verificationID: verificationID, resendingToken: nil)
+    }
+}
+
+@available(iOS 13, tvOS 13, macCatalyst 13, *)
+public extension PhoneMultiFactorGenerator {
+    /// Convenience overload so shared code can pass the generic auth credential wrapper type used on Android.
+    static func assertion(with credential: AuthCredential) -> PhoneMultiFactorAssertion {
+        guard let phoneCredential = credential as? PhoneAuthCredential else {
+            fatalError("PhoneMultiFactorGenerator.assertion(with:) requires a PhoneAuthCredential.")
+        }
+        return Self.assertion(with: phoneCredential)
     }
 }
 #endif
