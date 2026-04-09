@@ -7,6 +7,7 @@ import SkipFirebaseCore
 import android.app.Activity
 import kotlinx.coroutines.tasks.await
 import android.net.Uri
+import java.util.concurrent.TimeUnit
 import skip.ui.__
 
 // https://firebase.google.com/docs/reference/swift/firebaseauth/api/reference/Classes/Auth
@@ -443,6 +444,261 @@ public class EmailAuthProvider {
     }
 }
 
+public final class PhoneAuthResendingToken {
+    fileprivate let platformValue: com.google.firebase.auth.PhoneAuthProvider.ForceResendingToken
+
+    fileprivate init(_ platformValue: com.google.firebase.auth.PhoneAuthProvider.ForceResendingToken) {
+        self.platformValue = platformValue
+    }
+}
+
+public enum PhoneAuthVerificationResult {
+    case codeSent(verificationID: String, resendingToken: PhoneAuthResendingToken?)
+    case verificationCompleted(AuthCredential)
+}
+
+fileprivate final class PhoneAuthVerificationState {
+    private let lock = NSLock()
+    private var didResume = false
+    private let onResult: (PhoneAuthVerificationResult) -> Void
+    private let onFailure: (Error) -> Void
+    private let onCompletion: () -> Void
+
+    init(
+        onResult: @escaping (PhoneAuthVerificationResult) -> Void,
+        onFailure: @escaping (Error) -> Void,
+        onCompletion: @escaping () -> Void
+    ) {
+        self.onResult = onResult
+        self.onFailure = onFailure
+        self.onCompletion = onCompletion
+    }
+
+    func succeed(with result: PhoneAuthVerificationResult) {
+        lock.lock()
+        guard !didResume else {
+            lock.unlock()
+            return
+        }
+        didResume = true
+        lock.unlock()
+        android.util.Log.d("SkipFirebaseAuth", "Phone auth bridge resuming success")
+        onCompletion()
+        onResult(result)
+    }
+
+    func fail(with error: Error) {
+        lock.lock()
+        guard !didResume else {
+            lock.unlock()
+            return
+        }
+        didResume = true
+        lock.unlock()
+        android.util.Log.d("SkipFirebaseAuth", "Phone auth bridge resuming failure")
+        onCompletion()
+        onFailure(error)
+    }
+}
+
+fileprivate final class PhoneAuthStateDidChangeCallbacks : com.google.firebase.auth.PhoneAuthProvider.OnVerificationStateChangedCallbacks {
+    private let state: PhoneAuthVerificationState
+
+    init(state: PhoneAuthVerificationState) {
+        self.state = state
+        super.init()
+    }
+
+    public override func onVerificationCompleted(credential: com.google.firebase.auth.PhoneAuthCredential) {
+        android.util.Log.d("SkipFirebaseAuth", "Phone auth verification completed with credential")
+        state.succeed(with: .verificationCompleted(AuthCredential(credential)))
+    }
+
+    public override func onVerificationFailed(exception: com.google.firebase.FirebaseException) {
+        android.util.Log.e("SkipFirebaseAuth", "Phone auth verification failed", exception)
+        state.fail(with: mapAuthNSError(exception))
+    }
+
+    public override func onCodeSent(verificationId: String, forceResendingToken: com.google.firebase.auth.PhoneAuthProvider.ForceResendingToken) {
+        android.util.Log.d("SkipFirebaseAuth", "Phone auth code sent for verification ID: \(verificationId)")
+        state.succeed(with: .codeSent(verificationID: verificationId, resendingToken: PhoneAuthResendingToken(forceResendingToken)))
+    }
+
+    public override func onCodeAutoRetrievalTimeOut(verificationId: String) {
+        android.util.Log.d("SkipFirebaseAuth", "Phone auth auto retrieval timed out for verification ID: \(verificationId)")
+        // We resolve the async result on the first actionable outcome:
+        // either a verification ID is issued or a credential is returned directly.
+    }
+}
+
+fileprivate func unsupportedPhoneAuthCompletionError() -> Error {
+    NSError(
+        domain: "SkipFirebaseAuth",
+        code: -13,
+        userInfo: [
+            NSLocalizedDescriptionKey: "Phone auth completed without a verification ID. Use verifyPhoneNumberResult to handle instant verification on Android."
+        ]
+    )
+}
+
+// https://firebase.google.com/docs/reference/swift/firebaseauth/api/reference/Classes/PhoneAuthProvider
+// https://firebase.google.com/docs/reference/android/com/google/firebase/auth/PhoneAuthProvider
+public final class PhoneAuthProvider {
+    private static let activeVerificationCallbacksLock = NSLock()
+    private static var activeVerificationCallbacks: [String: PhoneAuthStateDidChangeCallbacks] = [:]
+
+    private let auth: com.google.firebase.auth.FirebaseAuth
+
+    private init(auth: com.google.firebase.auth.FirebaseAuth) {
+        self.auth = auth
+    }
+
+    public static let id: String = com.google.firebase.auth.PhoneAuthProvider.PROVIDER_ID
+
+    public static func provider() -> PhoneAuthProvider {
+        PhoneAuthProvider(auth: com.google.firebase.auth.FirebaseAuth.getInstance())
+    }
+
+    public static func provider(auth: Auth) -> PhoneAuthProvider {
+        PhoneAuthProvider(auth: auth.platformValue)
+    }
+
+    public func credential(withVerificationID verificationID: String, verificationCode: String) -> AuthCredential {
+        AuthCredential(com.google.firebase.auth.PhoneAuthProvider.getCredential(verificationID, verificationCode))
+    }
+
+    @MainActor
+    private func startVerification(
+        _ phoneNumber: String,
+        uiDelegate: Any? = nil,
+        timeout: TimeInterval = 60.0,
+        forceResendingToken: PhoneAuthResendingToken? = nil,
+        onResult: @escaping (PhoneAuthVerificationResult) -> Void,
+        onFailure: @escaping (Error) -> Void
+    ) {
+        _ = uiDelegate
+        let callbackID = UUID().uuidString
+
+        let state = PhoneAuthVerificationState(
+            onResult: onResult,
+            onFailure: onFailure,
+            onCompletion: {
+                PhoneAuthProvider.unregisterVerificationCallbacks(callbackID)
+            }
+        )
+        let callbacks = PhoneAuthStateDidChangeCallbacks(state: state)
+        PhoneAuthProvider.registerVerificationCallbacks(callbacks, callbackID: callbackID)
+
+        let builder = com.google.firebase.auth.PhoneAuthOptions.newBuilder(auth)
+            .setPhoneNumber(phoneNumber)
+            .setTimeout(Int64(max(timeout, 0.0).rounded()), TimeUnit.SECONDS)
+            .setCallbacks(callbacks)
+
+        if let activity: Activity = UIApplication.shared.androidActivity {
+            builder.setActivity(activity)
+        }
+        if let forceResendingToken {
+            builder.setForceResendingToken(forceResendingToken.platformValue)
+        }
+
+        com.google.firebase.auth.PhoneAuthProvider.verifyPhoneNumber(builder.build())
+    }
+
+    /// iOS-compatible completion API. If Android completes verification without issuing a verification ID,
+    /// the completion receives an error and callers should switch to `verifyPhoneNumberResult`.
+    @MainActor
+    public func verifyPhoneNumber(
+        _ phoneNumber: String,
+        uiDelegate: Any? = nil,
+        completion: @escaping (String?, Error?) -> Void
+    ) {
+        startVerification(
+            phoneNumber,
+            uiDelegate: uiDelegate,
+            onResult: { result in
+                switch result {
+                case .codeSent(let verificationID, _):
+                    completion(verificationID, nil)
+                case .verificationCompleted:
+                    completion(nil, unsupportedPhoneAuthCompletionError())
+                }
+            },
+            onFailure: { error in
+                completion(nil, error)
+            }
+        )
+    }
+
+    /// iOS-compatible async API. If Android completes verification without issuing a verification ID,
+    /// this throws and callers should switch to `verifyPhoneNumberResult`.
+    @MainActor
+    public func verifyPhoneNumber(_ phoneNumber: String, uiDelegate: Any? = nil) async throws -> String {
+        let verificationID = try await withCheckedThrowingContinuation { continuation in
+            startVerification(
+                phoneNumber,
+                uiDelegate: uiDelegate,
+                onResult: { result in
+                    android.util.Log.d("SkipFirebaseAuth", "Phone auth string continuation resume(returning/throwing:)")
+                    switch result {
+                    case .codeSent(let verificationID, _):
+                        continuation.resume(returning: verificationID)
+                    case .verificationCompleted:
+                        continuation.resume(throwing: unsupportedPhoneAuthCompletionError())
+                    }
+                },
+                onFailure: { error in
+                    android.util.Log.d("SkipFirebaseAuth", "Phone auth string continuation resume(throwing:)")
+                    continuation.resume(throwing: error)
+                }
+            )
+        }
+        android.util.Log.d("SkipFirebaseAuth", "Phone auth async string returned to caller")
+        return verificationID
+    }
+
+    /// Async phone verification API that returns the first actionable Firebase result:
+    /// either a verification ID was sent or Android completed instant verification with a credential.
+    /// The `uiDelegate` parameter is ignored on Android and exists for source compatibility with Apple platforms.
+    @MainActor
+    public func verifyPhoneNumberResult(
+        _ phoneNumber: String,
+        uiDelegate: Any? = nil,
+        timeout: TimeInterval = 60.0,
+        forceResendingToken: PhoneAuthResendingToken? = nil
+    ) async throws -> PhoneAuthVerificationResult {
+        let result = try await withCheckedThrowingContinuation { continuation in
+            startVerification(
+                phoneNumber,
+                uiDelegate: uiDelegate,
+                timeout: timeout,
+                forceResendingToken: forceResendingToken,
+                onResult: { result in
+                    android.util.Log.d("SkipFirebaseAuth", "Phone auth result continuation resume(returning:)")
+                    continuation.resume(returning: result)
+                },
+                onFailure: { error in
+                    android.util.Log.d("SkipFirebaseAuth", "Phone auth result continuation resume(throwing:)")
+                    continuation.resume(throwing: error)
+                }
+            )
+        }
+        android.util.Log.d("SkipFirebaseAuth", "Phone auth async result returned to caller")
+        return result
+    }
+
+    private static func registerVerificationCallbacks(_ callbacks: PhoneAuthStateDidChangeCallbacks, callbackID: String) {
+        activeVerificationCallbacksLock.lock()
+        defer { activeVerificationCallbacksLock.unlock() }
+        activeVerificationCallbacks[callbackID] = callbacks
+    }
+
+    private static func unregisterVerificationCallbacks(_ callbackID: String) {
+        activeVerificationCallbacksLock.lock()
+        defer { activeVerificationCallbacksLock.unlock() }
+        activeVerificationCallbacks.removeValue(forKey: callbackID)
+    }
+}
+
 // https://firebase.google.com/docs/reference/swift/firebaseauth/api/reference/Classes/OAuthProvider
 // https://firebase.google.com/docs/reference/android/com/google/firebase/auth/OAuthProvider
 public final class OAuthProvider {
@@ -499,12 +755,48 @@ public final class OAuthProvider {
         }
         return AuthCredential(builder.build())
     }
-
+	
     /// Convenience instance API matching iOS style
     public func credential(withIDToken idToken: String? = nil, accessToken: String? = nil, rawNonce: String? = nil) -> AuthCredential {
         return OAuthProvider.credential(providerID: providerID, idToken: idToken, rawNonce: rawNonce, accessToken: accessToken)
     }
 }
+
+#else
+import Foundation
+import FirebaseAuth
+
+public final class PhoneAuthResendingToken {
+    fileprivate init() {
+    }
+}
+
+public enum PhoneAuthVerificationResult {
+    case codeSent(verificationID: String, resendingToken: PhoneAuthResendingToken?)
+    case verificationCompleted(AuthCredential)
+}
+
+#if os(iOS)
+@available(iOS 13, tvOS 13, macCatalyst 13, *)
+public extension PhoneAuthProvider {
+    /// Async phone verification API that mirrors the Android wrapper.
+    /// On Apple platforms, `timeout` and `forceResendingToken` are ignored because the native API
+    /// only yields a verification ID or an error.
+    @MainActor
+    func verifyPhoneNumberResult(
+        _ phoneNumber: String,
+        uiDelegate: Any? = nil,
+        timeout: TimeInterval = 60.0,
+        forceResendingToken: PhoneAuthResendingToken? = nil
+    ) async throws -> PhoneAuthVerificationResult {
+        _ = timeout
+        _ = forceResendingToken
+
+        let verificationID = try await verifyPhoneNumber(phoneNumber, uiDelegate: uiDelegate as? FirebaseAuth.AuthUIDelegate)
+        return .codeSent(verificationID: verificationID, resendingToken: nil)
+    }
+}
+#endif
 
 #endif
 #endif
