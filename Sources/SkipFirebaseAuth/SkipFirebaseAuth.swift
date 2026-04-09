@@ -601,27 +601,6 @@ fileprivate func mappedAuthErrorCode(for exception: com.google.firebase.auth.Fir
     }
 }
 
-/// Best-effort extraction of a Firebase auth error code from a platform error.
-///
-/// On Android, this first inspects the underlying `FirebaseAuthException` chain before attempting
-/// any `NSError` compatibility mapping.
-public func authErrorCode(for error: Error) -> AuthErrorCode? {
-    // On Android, Firebase exposes MFA through FirebaseAuthMultiFactorException.
-    // Prefer the underlying exception chain over NSError projection.
-    if let authException = firebaseAuthException(for: error) {
-        return mappedAuthErrorCode(for: authException)
-    }
-    if let authError = error as? AuthNSError, let code = AuthErrorCode(rawValue: authError.code) {
-        return code
-    }
-    if let nsError = error as? NSError,
-       nsError.domain == AuthErrorDomain,
-       let code = AuthErrorCode(rawValue: nsError.code) {
-        return code
-    }
-    return nil
-}
-
 /// Best-effort extraction of a `MultiFactorResolver` from a platform error.
 ///
 /// On Android, this follows Firebase's native contract and prefers
@@ -1208,15 +1187,6 @@ public final class PhoneAuthResendingToken {
 public enum PhoneAuthVerificationResult {
     case codeSent(verificationID: String, resendingToken: PhoneAuthResendingToken?)
     case verificationCompleted(AuthCredential)
-}
-
-/// Best-effort extraction of a Firebase auth error code from a platform error.
-public func authErrorCode(for error: Error) -> AuthErrorCode? {
-    let nsError = error as NSError
-    guard nsError.domain == AuthErrorDomain else {
-        return nil
-    }
-    return AuthErrorCode(rawValue: nsError.code)
 }
 
 /// Best-effort extraction of a `MultiFactorResolver` from a platform error.

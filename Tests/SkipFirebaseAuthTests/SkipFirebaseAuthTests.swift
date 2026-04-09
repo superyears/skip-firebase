@@ -33,7 +33,6 @@ let logger: Logger = Logger(subsystem: "SkipBase", category: "Tests")
             let _: (MultiFactorResolver) -> [MultiFactorInfo] = { $0.hints }
             let _: (MultiFactorResolver) -> MultiFactorSession = { $0.session }
             let _: (MultiFactorResolver) -> Auth = { $0.auth }
-            let _: (Error) -> AuthErrorCode? = authErrorCode(for:)
             let _: (Error) -> MultiFactorResolver? = multiFactorResolver(for:)
             let _: (MultiFactorResolver, MultiFactorAssertion) async throws -> AuthDataResult = { resolver, assertion in
                 try await resolver.resolveSignIn(with: assertion)
