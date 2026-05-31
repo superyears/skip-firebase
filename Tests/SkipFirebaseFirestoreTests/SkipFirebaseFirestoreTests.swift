@@ -201,14 +201,6 @@ var appName: String = "SkipFirebaseDemo"
     }
 
     func testFirestore() async throws {
-        if isRobolectric {
-            // Firebase testing used to work in Robolectric, but then recently started failing around August 1st, 2025 (right when updating Robolectric from 4.14.1 to 4.15.1, but downgrading does not fix the problem). New log errors are:
-            //
-            // W/GooglePlayServicesUtil: skip.firebase.firestore.test requires the Google Play Store, but it is missing.
-            // E/GooglePlayServicesUtil: GooglePlayServices not available due to error 9
-            // W/Firestore: (25.1.3) [GrpcCallProvider]: Failed to update ssl context: com.google.android.gms.common.GooglePlayServicesNotAvailableException
-            throw XCTSkip("Firebase testing does not work in Robolectric")
-        }
         XCTAssertEqual(appName, self.app.name)
 
         let citiesRef = db.collection("cities")
@@ -428,3 +420,134 @@ extension SkipFirebaseFirestoreTests {
 struct TestData : Codable, Hashable {
     var testModuleName: String
 }
+
+// MARK: - Encoder/decoder unit tests (Android/Skip only — FirestoreEncoder/Decoder are Skip-only types)
+
+// Inline structs must be file-level in Skip (no type declarations inside functions)
+#if SKIP
+struct CodableCity: Codable, Equatable {
+    @DocumentID var id: String?
+    var name: String
+    var population: Int64
+    var active: Bool
+    var score: Double
+    var createdAt: Date?
+    var updatedAt: Timestamp?
+    @ServerTimestamp var serverTime: Timestamp?
+}
+
+struct _MString: Codable { var name: String }
+struct _MBool: Codable { var active: Bool }
+struct _MDate: Codable { var createdAt: Date }
+struct _MTimestamp: Codable { var ts: Timestamp }
+struct _MServerTimestamp: Codable { @ServerTimestamp var ts: Timestamp? }
+struct _MDocumentID: Codable { @DocumentID var id: String?; var name: String }
+
+@MainActor final class FirestoreCodecTests: XCTestCase {
+
+    func testEncoderPreservesString() throws {
+        let out = try FirestoreEncoder().encode(_MString(name: "Boston"))
+        XCTAssertEqual(out["name"] as? String, "Boston")
+    }
+
+    func testEncoderPreservesBoolTrue() throws {
+        let out = try FirestoreEncoder().encode(_MBool(active: true))
+        XCTAssertEqual(out["active"] as? Bool, true)
+    }
+
+    func testEncoderPreservesBoolFalse() throws {
+        let out = try FirestoreEncoder().encode(_MBool(active: false))
+        XCTAssertEqual(out["active"] as? Bool, false)
+    }
+
+    func testEncoderConvertsDateToTimestamp() throws {
+        let date = Date(timeIntervalSince1970: 1_234_567_890)
+        let out = try FirestoreEncoder().encode(_MDate(createdAt: date))
+        let ts = try XCTUnwrap(out["createdAt"] as? Timestamp)
+        XCTAssertEqual(ts.seconds, 1_234_567_890)
+        XCTAssertEqual(ts.nanoseconds, 0)
+    }
+
+    func testEncoderPreservesTimestampField() throws {
+        let ts = Timestamp(seconds: 999, nanoseconds: 42)
+        let out = try FirestoreEncoder().encode(_MTimestamp(ts: ts))
+        let result = try XCTUnwrap(out["ts"] as? Timestamp)
+        XCTAssertEqual(result.seconds, 999)
+        XCTAssertEqual(result.nanoseconds, 42)
+    }
+
+    func testEncoderServerTimestampNilBecomesFieldValue() throws {
+        let out = try FirestoreEncoder().encode(_MServerTimestamp())
+        XCTAssertTrue(out["ts"] is com.google.firebase.firestore.FieldValue)
+    }
+
+    func testEncoderServerTimestampNonNilPreservesTimestamp() throws {
+        let ts = Timestamp(seconds: 1000, nanoseconds: 0)
+        let out = try FirestoreEncoder().encode(_MServerTimestamp(ts: ts))
+        let result = try XCTUnwrap(out["ts"] as? Timestamp)
+        XCTAssertEqual(result.seconds, 1000)
+    }
+
+    func testEncoderDocumentIDNotEncoded() throws {
+        let out = try FirestoreEncoder().encode(_MDocumentID(name: "Test"))
+        XCTAssertNil(out["id"])
+        XCTAssertEqual(out["name"] as? String, "Test")
+    }
+
+    func testDecoderTimestampToDateField() throws {
+        let ts = Timestamp(seconds: 1_234_567_890, nanoseconds: 0)
+        let dict: [String: Any] = ["createdAt": ts]
+        let m: _MDate = try FirestoreDecoder().decode(from: dict)
+        XCTAssertEqual(m.createdAt.timeIntervalSince1970, 1_234_567_890, accuracy: 1.0)
+    }
+
+    func testDecoderTimestampToTimestampField() throws {
+        let ts = Timestamp(seconds: 999, nanoseconds: 42)
+        let dict: [String: Any] = ["ts": ts]
+        let m: _MTimestamp = try FirestoreDecoder().decode(from: dict)
+        XCTAssertEqual(m.ts.seconds, 999)
+        XCTAssertEqual(m.ts.nanoseconds, 42)
+    }
+
+    func testDecoderDocumentIDPopulatedWhenProvided() throws {
+        let dict: [String: Any] = ["name": "Boston"]
+        let m: _MDocumentID = try FirestoreDecoder().decode(from: dict, documentID: "BOS")
+        XCTAssertEqual(m.id, "BOS")
+        XCTAssertEqual(m.name, "Boston")
+    }
+
+    func testDecoderDocumentIDNilWhenNotProvided() throws {
+        let dict: [String: Any] = ["name": "Boston"]
+        let m: _MDocumentID = try FirestoreDecoder().decode(from: dict)
+        XCTAssertNil(m.id)
+        XCTAssertEqual(m.name, "Boston")
+    }
+
+    func testDecoderDocumentIDTakesFromRef_NotFromData() throws {
+        let dict: [String: Any] = ["name": "Boston", "id": "FROM_DATA"]
+        let m: _MDocumentID = try FirestoreDecoder().decode(from: dict, documentID: "FROM_REF")
+        XCTAssertEqual(m.id, "FROM_REF")
+    }
+
+    func testRoundtripCodableCity() throws {
+        let city = CodableCity(
+            name: "Boston",
+            population: 675_000,
+            active: true,
+            score: 9.5,
+            createdAt: Date(timeIntervalSince1970: 1_000_000),
+            updatedAt: Timestamp(seconds: 2_000_000, nanoseconds: 0),
+            serverTime: Timestamp(seconds: 3_000_000, nanoseconds: 0)
+        )
+        let encoded = try FirestoreEncoder().encode(city)
+        let decoded: CodableCity = try FirestoreDecoder().decode(from: encoded, documentID: "BOS")
+        XCTAssertEqual(decoded.id, "BOS")
+        XCTAssertEqual(decoded.name, "Boston")
+        XCTAssertEqual(decoded.population, 675_000)
+        XCTAssertEqual(decoded.active, true)
+        XCTAssertEqual(decoded.score, 9.5, accuracy: 0.001)
+        XCTAssertEqual(decoded.updatedAt?.seconds, 2_000_000)
+        XCTAssertEqual(decoded.serverTime?.seconds, 3_000_000)
+    }
+}
+#endif
